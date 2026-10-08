@@ -26,11 +26,13 @@ import {
 } from './git';
 import { linkWorktreeDeps, unlinkWorktreeDeps } from './worktreeDeps';
 import { HiveManager, type AgentMeta, type HiveMessage, type HiveTask } from './hive';
+import { parseImportedWorkflow, workflowProblems } from '../shared/workflowRules';
 import { HookServer } from './hooks';
 import { CircuitBreaker, type BreakerInput } from './breaker';
 import type { UsageProvider } from './usage';
 import { MemoryManager } from './memory';
 import { KnowledgeManager } from './knowledge';
+import { KnowledgeFolderIngestor } from './knowledgeFolders';
 import { MemoryReflector, type ReflectSettings } from './reflect';
 import { PersistStore } from './db';
 import { readAgentUsage, readContextTokens, seedSessionTranscript, resolveSessionCwd } from './transcript';
@@ -311,6 +313,12 @@ const memory = new MemoryManager(
 );
 // Enterprise Knowledge Graph — file-backed store + agent CLI (default OFF).
 const knowledge = new KnowledgeManager();
+// Point 7, as discussed: a registered folder/repo's condensed map is kept
+// current automatically -- initial scan + a debounced watcher per folder.
+// Reuses `hive.root()` so a registered folder always tracks the CURRENT
+// hive, including across a harnessHome change at runtime.
+const knowledgeFolders = new KnowledgeFolderIngestor(knowledge, () => hive.root());
+knowledgeFolders.watchAll(); // resume watching whatever was registered before this launch
 /** Reads the reflect tunables from config each tick (defaults baked in here so a
  *  pre-existing config.json without the keys still gets sane values). */
 function reflectSettings(): ReflectSettings {
@@ -3465,6 +3473,48 @@ ipcMain.handle('hive:setAgentHold', (_evt, id: unknown, hold: unknown) => {
 });
 ipcMain.handle('hive:board', () => hive.board());
 ipcMain.handle('hive:tasks', () => hive.tasks());
+
+// ─── IPC: workflow (view / import / human confirm) ──────────────────────────
+// Importing always stores the workflow UNCONFIRMED; only workflow:confirm (a
+// human click in the Workflow tab) can let it govern a run.
+ipcMain.handle('workflow:get', () => {
+  const workflow = hive.workflow();
+  return { workflow, problems: workflow ? workflowProblems(workflow) : [] };
+});
+ipcMain.handle('workflow:import', async (evt) => {
+  const win = BrowserWindow.fromWebContents(evt.sender);
+  if (!win) return { ok: false as const, error: 'no window' };
+  const res = await dialog.showOpenDialog(win, {
+    properties: ['openFile', 'openDirectory'],
+    title: 'Import a workflow (a .json file, or a folder containing workflow.json)',
+    filters: [{ name: 'Workflow JSON', extensions: ['json'] }, { name: 'All Files', extensions: ['*'] }]
+  });
+  if (res.canceled || res.filePaths.length === 0) return { ok: false as const, error: 'cancelled' };
+  try {
+    let file = res.filePaths[0];
+    if (statSync(file).isDirectory()) {
+      file = join(file, 'workflow.json');
+      if (!existsSync(file)) return { ok: false as const, error: 'That folder has no workflow.json.' };
+    }
+    if (statSync(file).size > 1024 * 1024) return { ok: false as const, error: 'Workflow file is larger than 1 MB.' };
+    const parsed = parseImportedWorkflow(JSON.parse(readFileSync(file, 'utf8')), basename(file, '.json'));
+    if (!parsed.ok) return { ok: false as const, error: parsed.error };
+    hive.setWorkflow(parsed.workflow);
+    return { ok: true as const, workflow: parsed.workflow, problems: workflowProblems(parsed.workflow) };
+  } catch (e) {
+    return { ok: false as const, error: e instanceof Error ? e.message : String(e) };
+  }
+});
+ipcMain.handle('workflow:confirm', (_evt, confirmed: unknown) => {
+  const workflow = hive.workflow();
+  if (!workflow) return { ok: false as const, error: 'No workflow to confirm.' };
+  if (confirmed === true) {
+    const problems = workflowProblems(workflow);
+    if (problems.length) return { ok: false as const, error: problems.join(' ') };
+  }
+  hive.setWorkflow({ ...workflow, confirmed: confirmed === true });
+  return { ok: true as const };
+});
 ipcMain.handle('hive:log', (_evt, n: unknown) => hive.logTail(typeof n === 'number' ? n : 200));
 ipcMain.handle('hive:memory', (_evt, id: unknown) => (typeof id === 'string' ? hive.memory(id) : ''));
 ipcMain.handle('hive:inbox', (_evt, id: unknown) => (typeof id === 'string' ? hive.inbox(id) : []));

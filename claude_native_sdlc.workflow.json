@@ -1,0 +1,61 @@
+{
+  "name": "Claude-Native SDLC",
+  "steps": [
+    {
+      "id": "requirement", "name": "Requirement", "is_start": true,
+      "description": "Turns the raw spec into a testable requirement: feature, scope summary, acceptance criteria (each traceable to the spec's own words), out-of-scope list. Single structured call, no tools. Must not invent scope.",
+      "allowed_next": ["architecture"]
+    },
+    {
+      "id": "architecture", "name": "Architecture",
+      "description": "Read-only (Read/Grep/Glob). Verifies paths in the real repo, decides change_required, names files_to_modify/create/delete, and writes the work order (objective, boundaries, definition_of_done) plus a component-level design. Never invents an existing contract.",
+      "allowed_next": ["quality", "testing", "finalize"]
+    },
+    {
+      "id": "quality", "name": "Quality / TDD",
+      "description": "Reads existing tests to match conventions, then writes tests for the acceptance criteria BEFORE any implementation. Write access only to test-shaped paths. Writing nothing is valid if existing tests already cover it.",
+      "allowed_next": ["coding"]
+    },
+    {
+      "id": "coding", "name": "Coding",
+      "description": "Implements the plan. Read, plus Write/Edit only on the files Architecture named; custom delete_file (only files_to_delete) and run_tests self-check. Never edits tests. Smallest change that satisfies the plan.",
+      "allowed_next": ["testing"]
+    },
+    {
+      "id": "testing", "name": "Testing",
+      "description": "Deterministic test run in an isolated venv, then one LLM call that writes the scorecard and GO / NO_GO. A non-passing run is forced to NO_GO in code. Routing is mechanical: pass+change goes to review, fail goes to failure analysis, pass+no change finalizes.",
+      "allowed_next": ["review", "failure_analysis", "finalize"]
+    },
+    {
+      "id": "failure_analysis", "name": "Failure Analysis",
+      "description": "Read-only (Read/Grep/Glob). Diagnoses which artifact is at fault: APPLICATION_DEFECT, TEST_DEFECT, CONTRACT_MISMATCH, SYNTAX_ERROR, ENVIRONMENT_ERROR. Routes to coding, quality, architecture or finalize. May name dependency_fix_files for Coding.",
+      "allowed_next": ["coding", "quality", "architecture", "finalize"]
+    },
+    {
+      "id": "review", "name": "Code Review",
+      "description": "Read-only plus the precomputed diff. Is the code correct, safe and in scope? Findings are BLOCKING or FOLLOW_UP and only real defects. Code forces BLOCKING for hardcoded secrets (Semgrep), known CVEs (pip-audit, only when a manifest changed) and undeclared changed files.",
+      "allowed_next": ["qa_review", "coding", "quality", "architecture"]
+    },
+    {
+      "id": "qa_review", "name": "QA Review",
+      "description": "Read-only. Does the test evidence PROVE each acceptance criterion (C1..Cn) is met? Marks each COVERED / PARTIAL / UNCOVERED, checks definition_of_done and weak or vacuous tests. Code forces UNCOVERED or unassessed criteria to BLOCKING.",
+      "allowed_next": ["release_planning", "coding", "quality", "architecture"]
+    },
+    {
+      "id": "release_planning", "name": "Release Planning",
+      "description": "No tools. Produces the release plan (title, summary, deployment steps, rollout, monitoring, rollback), feedback for the next cycle, and Jira/Confluence-shaped summaries. Reachable only after BOTH reviews PASS.",
+      "requires_human_approval": true,
+      "allowed_next": ["release_apply"]
+    },
+    {
+      "id": "release_apply", "name": "Release Apply",
+      "description": "Mechanical, no agent: commit, push (fork fallback if no write access), open the PR, write the issue and wiki records.",
+      "allowed_next": ["finalize"]
+    },
+    {
+      "id": "finalize", "name": "Finalize",
+      "description": "Derives the run outcome in code (APPROVED_RELEASED, NO_CHANGE_VERIFIED, REVIEW_BLOCKED, QA_BLOCKED, STAGNANT, EXHAUSTED_ITERATIONS, ...) and appends the run to the cross-run feedback log.",
+      "allowed_next": []
+    }
+  ]
+}

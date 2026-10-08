@@ -397,7 +397,8 @@
       "graph": "图谱",
       "activity": "动态",
       "skills": "技能",
-      "workers": "工人"
+      "workers": "工人",
+      "workflow": "工作流"
     },
     "terminalFullscreen": "终端已全屏打开。按 Esc 返回。",
     "noTerminal": "{{name}} 没有实时终端。",

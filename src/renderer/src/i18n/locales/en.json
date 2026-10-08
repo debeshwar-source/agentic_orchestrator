@@ -397,7 +397,8 @@
       "graph": "graph",
       "activity": "activity",
       "skills": "skills",
-      "workers": "workers"
+      "workers": "workers",
+      "workflow": "workflow"
     },
     "terminalFullscreen": "Terminal is open in fullscreen. Press Esc to bring it back.",
     "noTerminal": "{{name}} has no live terminal.",

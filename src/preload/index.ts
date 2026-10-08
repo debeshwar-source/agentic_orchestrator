@@ -1,3 +1,4 @@
+import type { Workflow as WorkflowDef } from '../shared/workflowRules';
 import { contextBridge, ipcRenderer, webUtils, type IpcRendererEvent } from 'electron';
 import type { AgentProvider } from '../shared/agentProvider';
 import type { HireManifest } from '../shared/hire';
@@ -761,6 +762,9 @@ const api = {
     ipcRenderer.invoke('hive:setAgentHold', id, hold),
   hiveBoard: (): Promise<string> => ipcRenderer.invoke('hive:board'),
   hiveTasks: (): Promise<unknown> => ipcRenderer.invoke('hive:tasks'),
+  workflowGet: (): Promise<{ workflow: WorkflowDef | null; problems: string[] }> => ipcRenderer.invoke('workflow:get'),
+  workflowImport: (): Promise<{ ok: true; workflow: WorkflowDef; problems: string[] } | { ok: false; error: string }> => ipcRenderer.invoke('workflow:import'),
+  workflowConfirm: (confirmed: boolean): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('workflow:confirm', confirmed),
   hiveLog: (n?: number): Promise<unknown[]> => ipcRenderer.invoke('hive:log', n ?? 200),
   hiveMemory: (id: string): Promise<string> => ipcRenderer.invoke('hive:memory', id),
   hiveInbox: (id: string): Promise<HiveMessage[]> => ipcRenderer.invoke('hive:inbox', id),

@@ -43,6 +43,17 @@ import { preferredAgentRole } from '../shared/agentRole';
 import { mergeTaskLedger } from '../shared/taskLedger';
 import { expandTilde } from './fs';
 import { resolveGodName } from '../shared/godIdentity';
+import {
+  applySignoffGate,
+  evaluateRejectLoop,
+  parseStepTag,
+  startStep,
+  validateAssignment,
+  validateTransition,
+  type SignoffVerdict,
+  type Workflow
+} from '../shared/workflowRules';
+import { formatImplementationSummary, type ImplementationEntry } from '../shared/implementationSummary';
 
 /** The subset of HarnessConfig the hive consumes for the default-MCP merge.
  *  Kept as a local shape so hive.ts never imports the foundation-owned config
@@ -123,6 +134,12 @@ export interface HiveTask {
    *  done-summary reply is posted back into. Consumed OUTBOUND only; populating
    *  it is the inbound/kanban side's job and does not affect routing. */
   slack?: { channel: string; thread_ts: string };
+  /** Set when this card is governed by a confirmed workflow (workflowRules.ts):
+   *  which step it represents, and -- once signed off -- the criterion-by-criterion
+   *  verdict that approved or rejected it. A task with no stepId is ordinary,
+   *  un-governed work; nothing here changes how those behave. */
+  stepId?: string;
+  signoff?: { criteria: { criterion: string; met: boolean; evidence: string }[]; approved: boolean; at: string };
   /** Set when this task originated from a generic webhook POST. Stores the SHA-256
    *  of the capability token (never the raw token — that's returned to the caller
    *  once and never persisted), so a GET status lookup can match by hashing the
@@ -1502,6 +1519,10 @@ export class HiveManager {
       `2. Record durable facts, decisions, and context by appending to ${inDir('memory.md')}.`,
       `3. To ask another agent for something or share information, write ONE message JSON into ${inDir('outbox')} (schema in PROTOCOL.md). NEVER write into another agent's folder — the orchestrator delivers your outbox.`,
       '4. At the END of a task, append what you learned to memory.md so future-you remembers.',
+      knowledgeGraph
+        ? `5a. Also read ${inRoot('knowledge-map.md')} (a condensed summary of every document in the knowledge base — not the full text; use \`kg get <id>\` yourself, as described below, if a task actually depends on the detail). It's a summary, not the whole picture — go deeper whenever the task genuinely needs it.`
+        : '',
+      `5b. Also read ${inRoot('implementation-summary.md')} (a condensed summary of what the team has already decided/built on the current task — the full result of any step is on its card in ${inRoot('tasks.json')}). It's a summary, not the whole picture — open the card whenever the task genuinely needs the full detail.`,
       guardrailsLine,
       memoryLine,
       knowledgeLine,
@@ -1562,6 +1583,38 @@ export class HiveManager {
     }
     const reg = this.registry();
     const godId = reg.godId ?? 'god';
+
+    // ---- Workflow enforcement (owner's build, 2026-10-08) ----
+    // A `[step:<id>]`-tagged subject is the only thing this touches —
+    // every other message is routed exactly as before. The orchestrator
+    // proposes (by tagging a dispatch); this is where code disposes,
+    // same split as resolve_next_node in the Python sibling build.
+    const stepTag = parseStepTag(msg.subject);
+    if (stepTag.stepId && msg.from === godId && (msg.act === 'request' || msg.act === 'propose')) {
+      const target = msg.to === 'human' || msg.to === 'god' ? godId : msg.to;
+      const check = this.checkWorkflowDispatch(stepTag.stepId, target);
+      if (!check.proceed) {
+        this.appendLog({ kind: 'workflow-violation', stepId: stepTag.stepId, to: target, reason: check.bounce });
+        this.deliver({ ...msg, to: godId, subject: `[workflow violation] ${check.bounce} — ${stepTag.subject}` }, godId);
+        return; // never delivered to the originally-proposed (illegal) target
+      }
+      msg = { ...msg, subject: stepTag.subject }; // strip the tag before the agent ever sees it
+    }
+    if (stepTag.stepId && msg.from === godId && (msg.act === 'agree' || msg.act === 'refuse')) {
+      let verdict: SignoffVerdict;
+      try {
+        const parsed = JSON.parse(msg.body);
+        verdict = { criteria: Array.isArray(parsed.criteria) ? parsed.criteria : [], rejectionReason: typeof parsed.rejection_reason === 'string' ? parsed.rejection_reason : '' };
+      } catch {
+        verdict = { criteria: [], rejectionReason: 'Sign-off body was not valid structured JSON — treated as no criteria checked.' };
+      }
+      const result = this.signOffTask(stepTag.stepId, verdict);
+      this.appendLog({ kind: 'workflow-signoff-applied', stepId: stepTag.stepId, approved: result.approved, escalated: result.escalated });
+      // Falls through to normal delivery below, unchanged — the agent
+      // still receives the agree/refuse reply with its reasoning, same
+      // as any other message; signOffTask above is a side effect on
+      // the task board, not a substitute for the message itself.
+    }
     // The hive has no separate human-approval queue — approvals are native to
     // each agent's Claude Code session (and approvable remotely). A message aimed
     // at "human" is handled by the god/orchestrator, the human's proxy here.
@@ -1833,6 +1886,159 @@ export class HiveManager {
     this.writeTasks(next);
     return true;
   }
+
+  // ============================================================
+  // WORKFLOW ENFORCEMENT (owner's build, 2026-10-08)
+  //
+  // A user-authored workflow becomes code-checked, not advisory, the
+  // same way `isPeerAssignment`-style enforcement would for "only
+  // Michael assigns" -- this codebase never had an equivalent for
+  // workflow steps, so routeMessage() below is where it's added.
+  // Tested in isolation, with no Electron/hive involved at all, by
+  // test/workflow-rules.test.cjs -- everything here is just that pure
+  // logic given somewhere to read/write its state and a chokepoint to
+  // run inside.
+  // ============================================================
+
+  /** workflow.json: the confirmed-or-not workflow definition. Never
+   *  governs a run until `.confirmed` is true -- see workflowRules.ts's
+   *  own docstring on why that gate exists and who may flip it (a
+   *  human, via the UI/CLI that calls setWorkflow -- never this class
+   *  on its own initiative). */
+  workflow(): Workflow | null {
+    const root = this.root();
+    if (!root) return null;
+    return this.readJson<Workflow | null>(join(root, 'workflow.json'), null);
+  }
+
+  setWorkflow(workflow: Workflow): void {
+    const root = this.root();
+    if (!root) return;
+    this.ensureHive();
+    this.atomicWriteJson(join(root, 'workflow.json'), workflow);
+    this.appendLog({ kind: 'workflow-set', name: workflow.name, confirmed: workflow.confirmed });
+    this.commit(`hive: workflow ${workflow.confirmed ? 'confirmed' : 'drafted'} (${workflow.name})`);
+  }
+
+  /** workflow-run.json: which step was last approved, and the
+   *  rejection-reason history per step the reject-loop breaker reads.
+   *  One active run at a time, matching this hive's own "one office"
+   *  model -- a second concurrent run needs a second hive, same as a
+   *  second project today. */
+  private workflowRunState(): { lastStepId: string | null; rejectHistory: Record<string, string[]> } {
+    const root = this.root();
+    if (!root) return { lastStepId: null, rejectHistory: {} };
+    return this.readJson(join(root, 'workflow-run.json'), { lastStepId: null, rejectHistory: {} });
+  }
+
+  private writeWorkflowRunState(state: { lastStepId: string | null; rejectHistory: Record<string, string[]> }): void {
+    const root = this.root();
+    if (!root) return;
+    this.atomicWriteJson(join(root, 'workflow-run.json'), state);
+  }
+
+  /** Called from routeMessage() for every message tagged `[step:<id>]`
+   *  -- true/false says whether normal delivery should proceed;
+   *  `bounce`, if set, is what to tell the god instead. Guarantees a
+   *  task card exists the moment a valid assignment is made (point 4:
+   *  never the orchestrator's choice to log), the same side-effect
+   *  pattern as with_step_counter/ensure_card in the Python sibling
+   *  build -- this is that same guarantee, in the actual router. */
+  private checkWorkflowDispatch(stepId: string, targetAgentId: string): { proceed: boolean; bounce?: string } {
+    const workflow = this.workflow();
+    if (!workflow) return { proceed: true }; // no workflow defined yet -- untagged-equivalent, don't block ordinary use
+    const run = this.workflowRunState();
+    const transition = validateTransition(workflow, run.lastStepId ?? undefined, stepId);
+    if (!transition.ok) return { proceed: false, bounce: `Workflow violation: ${transition.reason}` };
+    const reg = this.registry();
+    const isActive = (id: string): boolean => !!reg.agents[id] && !reg.agents[id].archived;
+    const assignment = validateAssignment(workflow, stepId, targetAgentId, isActive);
+    if (!assignment.ok) return { proceed: false, bounce: `Workflow violation: ${assignment.reason}` };
+    const step = workflow.steps[stepId];
+    this.addTask({
+      id: `step:${stepId}`,
+      title: step.name,
+      description: step.description,
+      assignee: targetAgentId,
+      status: 'doing',
+      dependsOn: [],
+      priority: 0,
+      createdAt: new Date().toISOString(),
+      stepId
+    });
+    this.patchTask(`step:${stepId}`, { status: 'doing', assignee: targetAgentId });
+    return { proceed: true };
+  }
+
+  /** Called from routeMessage() when the god sends an `agree`/`refuse`
+   *  reply tagged `[step:<id>]` -- its own sign-off, applied through
+   *  applySignoffGate so a bare "approved" with nothing checked can
+   *  never pass (point 3, as the owner chose: Michael IS the default
+   *  reviewer, but his verdict is never taken on faith). Rejections
+   *  bounce back to the SAME agent with the reason attached, bounded
+   *  by evaluateRejectLoop so a recurring rejection escalates instead
+   *  of looping forever. */
+  signOffTask(stepId: string, verdict: SignoffVerdict): { approved: boolean; escalated: boolean; note: string } {
+    const gated = applySignoffGate(verdict);
+    const cardId = `step:${stepId}`;
+    const now = new Date().toISOString();
+
+    if (gated.approved) {
+      const resultText = verdict.criteria.map((c) => `${c.criterion}: ${c.evidence}`).join('; ');
+      this.patchTask(cardId, { status: 'done', result: resultText, signoff: { criteria: gated.criteria, approved: true, at: now } });
+      const run = this.workflowRunState();
+      this.writeWorkflowRunState({ ...run, lastStepId: stepId });
+      this.appendLog({ kind: 'workflow-signoff', stepId, approved: true });
+      // Point 8's guaranteed side effect: every agent's default context
+      // grows by exactly one short entry the moment a step is actually
+      // approved -- never something the orchestrator has to remember to
+      // write up, same discipline as the task-card guarantee.
+      const ledger = this.tasks() as { tasks?: HiveTask[] };
+      const card = (ledger?.tasks ?? []).find((t) => t?.id === cardId);
+      this.appendImplementationEntry(stepId, card?.title ?? stepId, resultText, now);
+      return { approved: true, escalated: false, note: '' };
+    }
+
+    const run = this.workflowRunState();
+    const history = [...(run.rejectHistory[stepId] ?? []), gated.rejectionReason];
+    const loop = evaluateRejectLoop(history, 3);
+    this.writeWorkflowRunState({ ...run, rejectHistory: { ...run.rejectHistory, [stepId]: history } });
+    this.appendLog({ kind: 'workflow-signoff', stepId, approved: false, level: loop.level, reason: gated.rejectionReason });
+
+    if (loop.level === 'stop') {
+      this.patchTask(cardId, { status: 'blocked', humanQA: [{ q: loop.reason, askedAt: now }], signoff: { criteria: gated.criteria, approved: false, at: now } });
+      return { approved: false, escalated: true, note: loop.reason };
+    }
+    this.patchTask(cardId, { status: 'todo', result: `Sent back: ${gated.rejectionReason}`, signoff: { criteria: gated.criteria, approved: false, at: now } });
+    return { approved: false, escalated: false, note: loop.level === 'steer' ? loop.reason : gated.rejectionReason };
+  }
+
+  /** implementation-history.json: every step this run has actually
+   *  completed (the full, never-trimmed record -- implementation-
+   *  summary.md, which every agent is told to read, only ever shows
+   *  the bounded recent slice of it; see implementationSummary.ts). */
+  private implementationHistoryPath(): string | null {
+    const root = this.root();
+    return root ? join(root, 'implementation-history.json') : null;
+  }
+
+  private readImplementationHistory(): ImplementationEntry[] {
+    const p = this.implementationHistoryPath();
+    if (!p) return [];
+    return this.readJson<ImplementationEntry[]>(p, []);
+  }
+
+  private appendImplementationEntry(stepId: string, stepName: string, summary: string, approvedAt: string): void {
+    const p = this.implementationHistoryPath();
+    if (!p) return;
+    const history = this.readImplementationHistory();
+    history.push({ stepId, stepName, summary: summary.slice(0, 500), approvedAt });
+    this.atomicWriteJson(p, history);
+    const tasksPath = join(this.root() ?? '', 'tasks.json');
+    const mdPath = join(this.root() ?? '', 'implementation-summary.md');
+    writeFileSync(mdPath, formatImplementationSummary(history, tasksPath), 'utf8');
+  }
+
   memory(id: string): string {
     const p = join(this.agentDir(id), 'memory.md');
     return existsSync(p) ? readFileSync(p, 'utf8') : '';
